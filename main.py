@@ -143,11 +143,11 @@ def format_rows(rows: list[tuple], week_start: date, week_end: date, label: str)
 
 app = FastAPI()
 
-@app.get("/api/holidaybot")
+@app.get("/")
 def health():
     return {"ok": True, "message": "holidaybot up"}
 
-@app.post("/api/holidaybot")
+@app.post("/")
 async def holidaybot(req: Request):
     payload = await req.json()
 
