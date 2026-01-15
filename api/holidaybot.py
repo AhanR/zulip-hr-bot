@@ -97,12 +97,12 @@ def usage():
     )
 
 
-@app.get("/holidaybot")
+@app.get("/api/holidaybot")
 def health():
     return {"ok": True, "message": "holidaybot up"}
 
 
-@app.post("/holidaybot")
+@app.post("/api/holidaybot")
 async def holidaybot(req: Request):
     payload = await req.json()
 
