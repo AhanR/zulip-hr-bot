@@ -5,6 +5,8 @@ from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import psycopg
 
 # -----------------------
@@ -119,6 +121,15 @@ def usage() -> str:
         "• show leave week:this | week:next | week:2026-01-14\n"
     )
 
+def parse_week(sel: str | None):
+    today = datetime.now(TZ).date()
+    if not sel or sel in ("this", "current"):
+        return (*week_range(today), "this week")
+    if sel == "next":
+        return (*week_range(today + timedelta(days=7)), "next week")
+    anchor = parse_date(sel)
+    ws, we = week_range(anchor)
+    return ws, we, f"week of {ws}"
 
 def format_rows(rows: list[tuple], week_start: date, week_end: date, label: str) -> str:
     if not rows:
@@ -130,100 +141,84 @@ def format_rows(rows: list[tuple], week_start: date, week_end: date, label: str)
         lines.append(f"- {user_name}: {s} → {e}{r}")
     return "\n".join(lines)
 
+app = FastAPI()
 
-# -----------------------
-# Vercel Function handler
-# -----------------------
-class handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Useful for testing the endpoint in browser.
-        json_response(self, 200, {"ok": True, "message": "holidaybot endpoint up"})
+@app.get("/api/holidaybot")
+def health():
+    return {"ok": True, "message": "holidaybot up"}
 
-    def do_POST(self):
-        try:
-            if not DATABASE_URL:
-                return json_response(self, 500, {"content": "❌ Server misconfigured: DATABASE_URL is missing."})
+@app.post("/api/holidaybot")
+async def holidaybot(req: Request):
+    payload = await req.json()
 
-            raw = self.rfile.read(int(self.headers.get("content-length", "0") or "0"))
+    # Validate token
+    if OUTGOING_WEBHOOK_TOKEN:
+        if payload.get("token") != OUTGOING_WEBHOOK_TOKEN:
+            return JSONResponse({"response_not_required": True})
+
+    msg = payload.get("message", {})
+    content = payload.get("data") or msg.get("content") or ""
+    content = MENTION_RE.sub("", content).strip()
+
+    sender = msg.get("sender_full_name", "Unknown")
+    sender_id = msg.get("sender_id", 0)
+
+    if not content:
+        return {"content": usage()}
+
+    with psycopg.connect(DATABASE_URL) as con:
+        ensure_schema(con)
+
+        # ADD
+        m = ADD_RE.match(content)
+        if m:
             try:
-                payload = json.loads(raw.decode("utf-8") if raw else "{}")
-            except Exception:
-                return json_response(self, 400, {"content": "❌ Invalid JSON payload."})
+                start = parse_date(m.group("from"))
+                end = parse_date(m.group("to"))
+                reason = clean_reason(m.group("reason"))
 
-            # Auth: verify the outgoing webhook token if configured
-            incoming_token = payload.get("token")
-            if OUTGOING_WEBHOOK_TOKEN and incoming_token != OUTGOING_WEBHOOK_TOKEN:
-                return json_response(self, 403, {"response_not_required": True})
+                if end < start:
+                    raise ValueError("End date before start date")
 
-            # Zulip native format includes: payload["data"] (raw markdown), payload["message"] (dict)
-            msg = payload.get("message") or {}
-            content = (payload.get("data") or msg.get("content") or "").strip()
-            content = MENTION_RE.sub("", content).strip()  # remove leading "@**Bot**" mention if present
+                row = con.execute(
+                    """
+                    INSERT INTO leaves (user_id, user_name, start_date, end_date, reason)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (sender_id, sender, start, end, reason),
+                ).fetchone()
 
-            sender_name = msg.get("sender_full_name") or "Unknown"
-            sender_id = int(msg.get("sender_id") or 0)
+                return {
+                    "content": f"✅ Added leave #{row[0]} for {sender}: {start} → {end}"
+                    + (f' ("{reason}")' if reason else "")
+                }
+            except Exception as e:
+                return {"content": f"❌ {e}\n\n{usage()}"}
 
-            if not content:
-                return json_response(self, 200, {"content": f"Sorry, I didn’t get a command.\n\n{usage()}"})
+        # SHOW
+        m = SHOW_RE.match(content)
+        if m:
+            try:
+                ws, we, label = parse_week(m.group("week"))
+                rows = con.execute(
+                    """
+                    SELECT user_name, start_date, end_date, reason
+                    FROM leaves
+                    WHERE NOT (end_date < %s OR start_date > %s)
+                    ORDER BY start_date, user_name
+                    """,
+                    (ws, we),
+                ).fetchall()
 
-            # DB work
-            with psycopg.connect(DATABASE_URL) as con:
-                ensure_schema(con)
+                if not rows:
+                    return {"content": f"No leave for {label} ({ws} → {we})"}
 
-                m = ADD_RE.match(content)
-                if m:
-                    try:
-                        start = parse_date(m.group("from"))
-                        end = parse_date(m.group("to"))
-                        reason = clean_reason(m.group("reason"))
-                        if end < start:
-                            raise ValueError("End date is before start date.")
+                lines = [f"Leave for {label} ({ws} → {we}):"]
+                for u, s, e, r in rows:
+                    lines.append(f"- {u}: {s} → {e}" + (f' — "{r}"' if r else ""))
+                return {"content": "\n".join(lines)}
+            except Exception as e:
+                return {"content": f"❌ {e}\n\n{usage()}"}
 
-                        row = con.execute(
-                            """
-                            INSERT INTO leaves (user_id, user_name, start_date, end_date, reason)
-                            VALUES (%s, %s, %s, %s, %s)
-                            RETURNING id
-                            """,
-                            (sender_id, sender_name, start, end, reason),
-                        ).fetchone()
-
-                        leave_id = row[0] if row else "?"
-                        return json_response(
-                            self,
-                            200,
-                            {
-                                "content": (
-                                    f"✅ Added leave #{leave_id} for {sender_name}: {start} → {end}"
-                                    + (f' (reason: "{reason}")' if reason else "")
-                                )
-                            },
-                        )
-                    except Exception as e:
-                        return json_response(self, 200, {"content": f"❌ Could not add leave: {e}\n\n{usage()}"})
-
-                m = SHOW_RE.match(content)
-                if m:
-                    try:
-                        week_sel = m.group("week")
-                        ws, we, label = parse_week_selector(week_sel)
-
-                        rows = con.execute(
-                            """
-                            SELECT user_name, start_date, end_date, reason
-                            FROM leaves
-                            WHERE NOT (end_date < %s OR start_date > %s)
-                            ORDER BY start_date ASC, user_name ASC
-                            """,
-                            (ws, we),
-                        ).fetchall()
-
-                        return json_response(self, 200, {"content": format_rows(rows, ws, we, label)})
-                    except Exception as e:
-                        return json_response(self, 200, {"content": f"❌ Could not show leave: {e}\n\n{usage()}"})
-
-            return json_response(self, 200, {"content": f"Sorry, I didn’t understand.\n\n{usage()}"})
-
-        except Exception:
-            # Avoid leaking internals to chat; still return valid webhook response.
-            return json_response(self, 200, {"content": "❌ Something went wrong on the server."})
+    return {"content": usage()}
