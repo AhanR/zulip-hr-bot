@@ -20,6 +20,10 @@ ADD_RE = re.compile(
     r"""^\s*add\s+leave\s+from:(?P<from>\S+)\s+to:(?P<to>\S+)(?:\s+reason:(?P<reason>.+))?\s*$""",
     re.IGNORECASE,
 )
+REMOVE_RE = re.compile(
+    r"""^\s*remove\s+leave\s+from:(?P<from>\S+)\s+to:(?P<to>\S+)(?:\s+reason:(?P<reason>.+))?\s*$""",
+    re.IGNORECASE,
+)
 SHOW_RE = re.compile(
     r"""^\s*show\s+leave(?:\s+week:(?P<week>\S+))?\s*$""",
     re.IGNORECASE,
@@ -91,9 +95,10 @@ def ensure_schema(con):
 def usage():
     return (
         "Commands:\n"
-        "• add leave from:14Jan26 to:16Jan26 reason:\"study leave\"\n"
-        "• show leave\n"
-        "• show leave week:this | week:next | week:2026-01-14\n"
+        "- add leave from:14Jan26 to:16Jan26 reason:\"study leave\"\n"
+        "- remove leave from:14Jan26 to:16Jan26 reason:\"change in plan\"\n"
+        "- show leave\n"
+        "- show leave week:this | week:next | week:2026-01-14\n"
     )
 
 
@@ -148,6 +153,91 @@ async def holidaybot(req: Request):
                 }
             except Exception as e:
                 return {"content": f"❌ Could not add leave: {e}\n\n{usage()}"}
+
+
+        m = REMOVE_RE.match(content)
+        if m:
+            try:
+                rem_start = parse_date(m.group("from"))
+                rem_end = parse_date(m.group("to"))
+                _reason = clean_reason(m.group("reason"))
+                if rem_end < rem_start:
+                    raise ValueError("End date is before start date.")
+
+                rows = con.execute(
+                    """
+                    SELECT id, start_date, end_date, reason
+                    FROM leaves
+                    WHERE user_id = %s
+                      AND NOT (end_date < %s OR start_date > %s)
+                    ORDER BY start_date ASC, id ASC
+                    """,
+                    (sender_id, rem_start, rem_end),
+                ).fetchall()
+
+                if not rows:
+                    return {
+                        "content": f"No leave found for {sender} overlapping {rem_start} -> {rem_end}."
+                    }
+
+                deleted = 0
+                updated = 0
+                inserted = 0
+
+                for leave_id, start, end, reason in rows:
+                    # Case: removal covers entire leave -> delete
+                    if rem_start <= start and rem_end >= end:
+                        con.execute("DELETE FROM leaves WHERE id = %s", (leave_id,))
+                        deleted += 1
+                        continue
+
+                    # Case: trim the start (overlaps at beginning)
+                    if rem_start <= start <= rem_end < end:
+                        new_start = rem_end + timedelta(days=1)
+                        con.execute(
+                            "UPDATE leaves SET start_date = %s WHERE id = %s",
+                            (new_start, leave_id),
+                        )
+                        updated += 1
+                        continue
+
+                    # Case: trim the end (overlaps at end)
+                    if start < rem_start <= end <= rem_end:
+                        new_end = rem_start - timedelta(days=1)
+                        con.execute(
+                            "UPDATE leaves SET end_date = %s WHERE id = %s",
+                            (new_end, leave_id),
+                        )
+                        updated += 1
+                        continue
+
+                    # Case: split into two ranges (removal in the middle)
+                    if start < rem_start and end > rem_end:
+                        left_end = rem_start - timedelta(days=1)
+                        right_start = rem_end + timedelta(days=1)
+                        con.execute(
+                            "UPDATE leaves SET end_date = %s WHERE id = %s",
+                            (left_end, leave_id),
+                        )
+                        con.execute(
+                            """
+                            INSERT INTO leaves (user_id, user_name, start_date, end_date, reason)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (sender_id, sender, right_start, end, reason),
+                        )
+                        updated += 1
+                        inserted += 1
+                        continue
+
+                return {
+                    "content": (
+                        f"Removed leave for {sender} in {rem_start} -> {rem_end}. "
+                        f"Deleted: {deleted}, updated: {updated}, split: {inserted}."
+                    )
+                }
+            except Exception as e:
+                return {"content": f"Could not remove leave: {e}\n\n{usage()}"}
 
         m = SHOW_RE.match(content)
         if m:
