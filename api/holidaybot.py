@@ -1,6 +1,7 @@
 import os
 import re
 from datetime import datetime, date, timedelta
+from calendar import monthrange
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -28,6 +29,10 @@ SHOW_RE = re.compile(
     r"""^\s*show\s+leave(?:\s+week:(?P<week>\S+))?\s*$""",
     re.IGNORECASE,
 )
+MONTH_RE = re.compile(
+    r"""^\s*show\s+leave(?:\s+month:(?P<month>\S+))(?:\s+to:(?P<to>\S+))?\s*$""",
+    re.IGNORECASE,
+)
 MENTION_RE = re.compile(r"^@\*\*[^*]+\*\*\s*", re.UNICODE)
 
 
@@ -52,7 +57,7 @@ def clean_reason(r: str | None) -> str:
 
 def week_range(anchor: date):
     start = anchor - timedelta(days=anchor.weekday())  # Mon
-    end = start + timedelta(days=6)                    # Sun
+    end = start + timedelta(days=6)  # Sun
     return start, end
 
 
@@ -65,7 +70,6 @@ def parse_week(sel: str | None):
         ws, we = week_range(today + timedelta(days=7))
         return ws, we, "next week"
 
-    # allow week:2026-01-14 or week:14Jan26
     if re.search(r"[A-Za-z]", sel):
         anchor = parse_date(sel)
     else:
@@ -73,6 +77,28 @@ def parse_week(sel: str | None):
 
     ws, we = week_range(anchor)
     return ws, we, f"week of {ws}"
+
+
+def month_range(sel: str):
+    today = datetime.now(TZ).date()
+    s = sel.strip().lower()
+
+    if s in ("this", "current"):
+        y, m = today.year, today.month
+    elif s == "next":
+        if today.month == 12:
+            y, m = today.year + 1, 1
+        else:
+            y, m = today.year, today.month + 1
+    else:
+        y, m = map(int, sel.split("-"))
+        if not (1 <= m <= 12):
+            raise ValueError("Month must be in YYYY-MM format.")
+
+    start = date(y, m, 1)
+    end = date(y, m, monthrange(y, m)[1])
+    label = "this month" if s in ("this", "current") else "next month" if s == "next" else f"{y:04d}-{m:02d}"
+    return start, end, label
 
 
 def ensure_schema(con):
@@ -99,6 +125,8 @@ def usage():
         "- remove leave from:14Jan26 to:16Jan26 reason:\"change in plan\"\n"
         "- show leave\n"
         "- show leave week:this | week:next | week:2026-01-14\n"
+        "- show leave month:this | month:next | month:2026-01\n"
+        "- show leave month:2026-01 to:2026-02\n"
     )
 
 
@@ -154,7 +182,6 @@ async def holidaybot(req: Request):
             except Exception as e:
                 return {"content": f"❌ Could not add leave: {e}\n\n{usage()}"}
 
-
         m = REMOVE_RE.match(content)
         if m:
             try:
@@ -185,13 +212,11 @@ async def holidaybot(req: Request):
                 inserted = 0
 
                 for leave_id, start, end, reason in rows:
-                    # Case: removal covers entire leave -> delete
                     if rem_start <= start and rem_end >= end:
                         con.execute("DELETE FROM leaves WHERE id = %s", (leave_id,))
                         deleted += 1
                         continue
 
-                    # Case: trim the start (overlaps at beginning)
                     if rem_start <= start <= rem_end < end:
                         new_start = rem_end + timedelta(days=1)
                         con.execute(
@@ -201,7 +226,6 @@ async def holidaybot(req: Request):
                         updated += 1
                         continue
 
-                    # Case: trim the end (overlaps at end)
                     if start < rem_start <= end <= rem_end:
                         new_end = rem_start - timedelta(days=1)
                         con.execute(
@@ -211,7 +235,6 @@ async def holidaybot(req: Request):
                         updated += 1
                         continue
 
-                    # Case: split into two ranges (removal in the middle)
                     if start < rem_start and end > rem_end:
                         left_end = rem_start - timedelta(days=1)
                         right_start = rem_end + timedelta(days=1)
@@ -262,5 +285,35 @@ async def holidaybot(req: Request):
                 return {"content": "\n".join(lines)}
             except Exception as e:
                 return {"content": f"❌ Could not show leave: {e}\n\n{usage()}"}
+
+        m = MONTH_RE.match(content)
+        if m:
+            try:
+                start, end, label = month_range(m.group("month"))
+                if m.group("to"):
+                    end_start, end_end, end_label = month_range(m.group("to"))
+                    start = min(start, end_start)
+                    end = max(end, end_end)
+                    label = f"{label} to {end_label}"
+
+                rows = con.execute(
+                    """
+                    SELECT user_name, start_date, end_date, reason
+                    FROM leaves
+                    WHERE NOT (end_date < %s OR start_date > %s)
+                    ORDER BY start_date ASC, user_name ASC
+                    """,
+                    (start, end),
+                ).fetchall()
+
+                if not rows:
+                    return {"content": f"No leave recorded for {label} ({start} to {end})."}
+
+                lines = [f"Leave for {label} ({start} to {end}):"]
+                for u, s, e, r in rows:
+                    lines.append(f"- {u}: {s} → {e}" + (f' — "{r}"' if r else ""))
+                return {"content": "\n".join(lines)}
+            except Exception as e:
+                return {"content": f"❌ Could not show month leave: {e}\n\n{usage()}"}
 
     return {"content": f"Sorry, I didn't understand.\n\n{usage()}"}
